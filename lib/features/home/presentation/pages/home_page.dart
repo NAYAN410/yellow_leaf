@@ -1,7 +1,10 @@
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:flutter_tflite/flutter_tflite.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:image/image.dart' as img;
 import '../../../../core/constants/app_assets.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../domain/models/plant_disease_info.dart';
@@ -20,50 +23,99 @@ class _HomePageState extends State<HomePage> {
   PlantDiseaseInfo? _diseaseInfo;
   double _confidence = 0.0;
   bool _loading = false;
+  
+  Interpreter? _interpreter;
+  List<String>? _labels;
   final imagePicker = ImagePicker();
 
   @override
   void initState() {
     super.initState();
     _loadModel();
+    _loadLabels();
   }
 
   @override
   void dispose() {
-    Tflite.close();
+    _interpreter?.close();
     super.dispose();
   }
 
-  Future _loadModel() async {
+  Future<void> _loadModel() async {
     try {
-      await Tflite.loadModel(
-        model: AppAssets.plantModel,
-        labels: AppAssets.plantLabels,
-      );
+      _interpreter = await Interpreter.fromAsset(AppAssets.plantModel);
+      debugPrint("Interpreter loaded successfully");
     } catch (e) {
       debugPrint("Failed to load model: $e");
     }
   }
 
-  Future _classifyImage(File image) async {
+  Future<void> _loadLabels() async {
+    try {
+      final labelsData = await rootBundle.loadString(AppAssets.plantLabels);
+      _labels = labelsData.split('\n').where((s) => s.isNotEmpty).toList();
+      debugPrint("Labels loaded: ${_labels?.length}");
+    } catch (e) {
+      debugPrint("Failed to load labels: $e");
+    }
+  }
+
+  Future<void> _classifyImage(File image) async {
+    if (_interpreter == null || _labels == null) {
+      debugPrint("Interpreter or labels not loaded");
+      return;
+    }
+
     setState(() {
       _loading = true;
       _diseaseInfo = null;
     });
-    
-    try {
-      var output = await Tflite.runModelOnImage(
-        path: image.path,
-        numResults: 1,
-        threshold: 0.2,
-        imageMean: 127.5,
-        imageStd: 127.5,
-      );
 
-      if (output != null && output.isNotEmpty) {
+    try {
+      // 1. Read image and preprocess
+      final imageData = await image.readAsBytes();
+      img.Image? originalImage = img.decodeImage(imageData);
+      if (originalImage == null) return;
+
+      // Resize to match model input (typically 224x224)
+      img.Image resizedImage = img.copyResize(originalImage, width: 224, height: 224);
+
+      // Convert to Float32List and normalize (0-255 -> -1.0 to 1.0 using mean 127.5, std 127.5)
+      var input = Float32List(1 * 224 * 224 * 3);
+      var buffer = Float32List.view(input.buffer);
+      int pixelIndex = 0;
+      for (int y = 0; y < 224; y++) {
+        for (int x = 0; x < 224; x++) {
+          final pixel = resizedImage.getPixel(x, y);
+          buffer[pixelIndex++] = (img.getRed(pixel) - 127.5) / 127.5;
+          buffer[pixelIndex++] = (img.getGreen(pixel) - 127.5) / 127.5;
+          buffer[pixelIndex++] = (img.getBlue(pixel) - 127.5) / 127.5;
+        }
+      }
+
+      // 2. Prepare output buffer
+      // Based on previous error, shape is [1, 15]
+      var output = List.filled(1 * 15, 0.0).reshape([1, 15]);
+
+      // 3. Run inference
+      _interpreter!.run(input.buffer.asFloat32List().reshape([1, 224, 224, 3]), output);
+
+      // 4. Process output
+      List<double> probabilities = List<double>.from(output[0]);
+      double maxProb = -1.0;
+      int maxIndex = -1;
+
+      for (int i = 0; i < probabilities.length; i++) {
+        if (probabilities[i] > maxProb) {
+          maxProb = probabilities[i];
+          maxIndex = i;
+        }
+      }
+
+      if (maxIndex != -1 && maxIndex < _labels!.length) {
         setState(() {
-          _diseaseInfo = PlantDiseaseInfo.fromLabel(output[0]['label']);
-          _confidence = output[0]['confidence'] * 100;
+          _diseaseInfo = PlantDiseaseInfo.fromLabel(_labels![maxIndex]);
+          _confidence = maxProb * 100;
           _loading = false;
         });
       } else {
@@ -72,14 +124,14 @@ class _HomePageState extends State<HomePage> {
         });
       }
     } catch (e) {
-      debugPrint("Failed to run model: $e");
+      debugPrint("Inference error: $e");
       setState(() {
         _loading = false;
       });
     }
   }
 
-  Future _pickImage(ImageSource source) async {
+  Future<void> _pickImage(ImageSource source) async {
     final pickedFile = await imagePicker.pickImage(source: source);
     if (pickedFile != null) {
       setState(() {
@@ -102,7 +154,6 @@ class _HomePageState extends State<HomePage> {
         padding: const EdgeInsets.all(20),
         child: Column(
           children: [
-            // Image Preview Card
             Card(
               elevation: 4,
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
@@ -129,7 +180,6 @@ class _HomePageState extends State<HomePage> {
             ),
             const SizedBox(height: 20),
             
-            // Result Section
             if (_loading)
               const CircularProgressIndicator()
             else if (_diseaseInfo != null)
@@ -162,7 +212,6 @@ class _HomePageState extends State<HomePage> {
             
             const SizedBox(height: 30),
             
-            // Buttons
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [

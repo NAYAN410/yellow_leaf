@@ -1,10 +1,7 @@
-name: iOS-ipa-build
+name: iOS Test Build (No Sign)
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   build-ios:
@@ -17,30 +14,46 @@ jobs:
         with:
           channel: stable
 
-      - run: flutter pub get
+      - name: Install dependencies
+        run: flutter pub get
 
-      # ✅ FIX HERE
-      - name: Fix Podfile platform
+      # Fix Podfile platform issue
+      - name: Fix Podfile
         run: |
           echo "platform :ios, '13.0'" | cat - ios/Podfile > temp && mv temp ios/Podfile
 
-      - run: cd ios && pod install --repo-update
+      # Clean old pods
+      - name: Clean Pods
+        run: |
+          rm -rf ios/Pods ios/Podfile.lock
 
-      - run: flutter build ios --release --no-codesign
+      # Install pods properly
+      - name: Install Pods
+        run: |
+          cd ios
+          pod install --repo-update
 
-      - run: mkdir -p build/ios/iphoneos/Payload
-      - run: mv build/ios/iphoneos/Runner.app build/ios/iphoneos/Payload/
+      # Build without signing (important fix)
+      - name: Build iOS (no signing)
+        run: |
+          cd ios
+          xcodebuild -workspace Runner.xcworkspace \
+          -scheme Runner \
+          -configuration Release \
+          -sdk iphoneos \
+          -destination 'generic/platform=iOS' \
+          CODE_SIGNING_ALLOWED=NO
 
+      # Create IPA manually
       - name: Create IPA
         run: |
-          cd build/ios/iphoneos
-          zip -r FlutterIpaExport.ipa Payload
+          mkdir Payload
+          cp -r ios/build/Release-iphoneos/Runner.app Payload/
+          zip -r app.ipa Payload
 
+      # Upload artifact
       - name: Upload IPA
-        uses: svenstaro/upload-release-action@v2
+        uses: actions/upload-artifact@v3
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: build/ios/iphoneos/FlutterIpaExport.ipa
-          tag: v1.0
-          overwrite: true
-          body: "iOS IPA build"
+          name: ios-ipa
+          path: app.ipa
